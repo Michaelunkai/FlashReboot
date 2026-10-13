@@ -1370,6 +1370,7 @@ function Invoke-FlashReboot {
     $after = Get-FrSystemSnapshot 'after'
     $usable = Test-FrUsable
     $total.Stop()
+    $script:FR_WALL.Stop()   # wall clock freezes at the READY point
 
     # ---- after the READY point: boot-like background completions + verification
     $taskCount = Get-FrLogonTaskCount
