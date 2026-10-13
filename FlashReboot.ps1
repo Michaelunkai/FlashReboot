@@ -313,6 +313,9 @@ public static class FrNative {
         } finally { CloseHandle(hTok); }
     }
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern IntPtr FindWindowW(string lpClassName, string lpWindowName);
+
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct TOKEN_PRIVILEGES {
         public int PrivilegeCount;
@@ -436,104 +439,125 @@ function Invoke-MemoryPhase {
 
     return [pscustomobject]$result
 }
+function Test-FrTaskbarAlive {
+    <# The REAL taskbar health signal: the Shell_TrayWnd window exists.
+       (Progman is not a valid signal on recent Windows 11 builds.) #>
+    [CmdletBinding()] param()
+    return ([FrNative]::FindWindowW('Shell_TrayWnd', $null) -ne [IntPtr]::Zero)
+}
+
 function Restart-FrExplorer {
-    <# Reboot effect #4: the shell itself is cycled. Graceful close first, then
-       the optional cache-purge window (icon/thumb caches are only deletable
-       while the shell is down), then relaunch and wait for the desktop shell. #>
+    <# Reboot effect #4: the shell itself is cycled, with permanent taskbar
+       guarantees:
+         - the shell is relaunched with the LOGGED-ON USER's token (never
+           elevated - an elevated desktop shell breaks taskbar drag-drop/tray),
+         - success is judged by the Shell_TrayWnd taskbar window existing,
+         - Windows' AutoRestartShell is suspended during the restart window and
+           ALWAYS restored (a stuck 0 leaves the taskbar unrecoverable). #>
     [CmdletBinding()] param([switch]$WithCachePurge)
 
     $beforePid = (Get-Process -Name explorer -ErrorAction SilentlyContinue |
                   Select-Object -First 1 -ExpandProperty Id)
     $sw = [System.Diagnostics.Stopwatch]::StartNew()
 
-    # graceful close of shell windows
-    Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object {
-        try { [void]$_.CloseMainWindow() } catch { }
-    } | Out-Null
-    Start-Sleep -Milliseconds 600
-    Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object {
-        try { $_.Kill(); $_.WaitForExit(1500) | Out-Null } catch { }
-    }
-    Write-FrLog ("shell: old explorer closed at {0} ms" -f $sw.ElapsedMilliseconds) 'INFO'
-
-    # explorer-down window: cache rebuild sources removed (functions from steps 21/23)
-    if ($WithCachePurge -and (Get-Command Invoke-FrExplorerCachePurge -ErrorAction SilentlyContinue)) {
-        try { Invoke-FrExplorerCachePurge } catch {
-            $script:FR_ERRORS.Add("shell.cachepurge: $($_.Exception.Message)") | Out-Null
-        }
+    $winlogonKey = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon'
+    $autoRestartSaved = (Get-ItemProperty -Path $winlogonKey -Name AutoRestartShell -ErrorAction SilentlyContinue).AutoRestartShell
+    if (-not $script:FR_DRYRUN -and $null -ne $autoRestartSaved -and $autoRestartSaved -ne 0) {
+        Set-ItemProperty -Path $winlogonKey -Name AutoRestartShell -Value 0
     }
 
-    # Boot-parity shell relaunch via Task Scheduler: an /IT + /RL LIMITED task
-    # runs explorer.exe with the LOGGED-ON USER's normal (non-elevated) token
-    # and a registry-built fresh environment - exactly what winlogon does at
-    # boot. Launching the desktop shell from our elevated token makes it an
-    # elevated shell, which breaks taskbar drag-drop/tray/UX for the user.
-    $taskName = 'FlashRebootShellRestart'
-    $afterPid = $null; $method = 'task-scheduler-medium-il'
-    $null = Invoke-FrEffect -Description "register one-shot shell restart task ($taskName)" -Effect {
-        & "$env:WINDIR\System32\schtasks.exe" /Create /TN $taskName /TR "`"$env:WINDIR\explorer.exe`"" `
-            /SC ONCE /ST 00:00 /IT /F /RL LIMITED | Out-Null
-    }
-    $deadline = [DateTime]::UtcNow.AddSeconds(6)
-    while ([DateTime]::UtcNow -lt $deadline -and -not $afterPid) {
-        $null = Invoke-FrEffect -Description 'run shell restart task (medium-IL explorer, fresh env)' -Effect {
-            & "$env:WINDIR\System32\schtasks.exe" /Run /TN $taskName | Out-Null
+    $afterPid = $null; $method = 'task-scheduler-medium-il'; $taskbarAlive = $false
+    try {
+        # graceful close, then kill, then wait until NO explorer remains
+        Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object {
+            try { [void]$_.CloseMainWindow() } catch { }
+        } | Out-Null
+        Start-Sleep -Milliseconds 600
+        Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object {
+            try { $_.Kill(); $_.WaitForExit(1500) | Out-Null } catch { }
         }
-        $spawnDeadline = [DateTime]::UtcNow.AddSeconds(2)
-        while ([DateTime]::UtcNow -lt $spawnDeadline -and -not $afterPid) {
-            $p = Get-Process -Name explorer -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Id -ne $beforePid } | Select-Object -First 1
-            if ($p) { $afterPid = $p.Id; break }
-            Start-Sleep -Milliseconds 120
+        $zeroDeadline = [DateTime]::UtcNow.AddSeconds(3)
+        while ([DateTime]::UtcNow -lt $zeroDeadline) {
+            if (-not (Get-Process -Name explorer -ErrorAction SilentlyContinue)) { break }
+            Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }
+            Start-Sleep -Milliseconds 200
         }
-    }
-    $null = Invoke-FrEffect -Description 'remove one-shot task' -Effect {
-        & "$env:WINDIR\System32\schtasks.exe" /Delete /TN $taskName /F | Out-Null
-    }
-    Write-FrLog ("shell: relaunched via {0} (pid {1}) at {2} ms" -f `
-        $method, $(if ($afterPid) { $afterPid } else { 'none' }), $sw.ElapsedMilliseconds) 'INFO'
+        Write-FrLog ("shell: old explorer closed at {0} ms" -f $sw.ElapsedMilliseconds) 'INFO'
 
-    if (-not $afterPid) {
-        # last-resort: keep the desktop alive even if the task path failed
-        $r = [FrNative]::LaunchWithFreshEnvironment((Join-Path $env:WINDIR 'explorer.exe'), '', $null)
-        if ($r -notlike 'ERR:*') {
-            $afterPid = [int]$r; $method = 'fresh-env-fallback-elevated'
-            Write-FrLog 'shell: FALLBACK relaunched ELEVATED (taskbar parity degraded; logged for diagnosis)' 'WARN'
-        } else {
-            $script:FR_ERRORS.Add("shell.freshenv: $r") | Out-Null
-        }
-    }
-    if ($afterPid) {
-        # NOTE: the fresh shell needs a couple of seconds to show its window
-        # (cold caches - same as a real boot). We do NOT wait here: remaining
-        # phases run while the shell warms up, and the final READY verifier
-        # proves the window before declaring success.
-        # clean up any duplicate shell (defensive: none expected with
-        # AutoRestartShell disabled for the window)
-        $dupDeadline = [DateTime]::UtcNow.AddSeconds(1)
-        while ([DateTime]::UtcNow -lt $dupDeadline) {
-            $dups = @(Get-Process -Name explorer -ErrorAction SilentlyContinue |
-                      Where-Object { $_.Id -ne $beforePid -and $_.Id -ne $afterPid })
-            if ($dups.Count -eq 0) { break }
-            $dups | ForEach-Object {
-                try { $_.Kill(); Write-FrLog "Cleaned up duplicate shell instance (PID $($_.Id))" 'INFO' } catch { }
+        # explorer-down window: cache rebuild sources removed (functions from steps 21/23)
+        if ($WithCachePurge -and (Get-Command Invoke-FrExplorerCachePurge -ErrorAction SilentlyContinue)) {
+            try { Invoke-FrExplorerCachePurge } catch {
+                $script:FR_ERRORS.Add("shell.cachepurge: $($_.Exception.Message)") | Out-Null
             }
-            Start-Sleep -Milliseconds 250
         }
-    } else {
-        # fallback: wait for the system's own auto-restart (fresh boot-ish, but
-        # env may be inherited - log it honestly)
-        $method = 'auto-restart-fallback'
-        $deadline = [DateTime]::UtcNow.AddSeconds(5)
-        while ([DateTime]::UtcNow -lt $deadline) {
-            $p = Get-Process -Name explorer -ErrorAction SilentlyContinue |
-                 Where-Object { $_.Id -ne $beforePid -and $_.MainWindowHandle -ne 0 } |
-                 Select-Object -First 1
-            if ($p) { $afterPid = $p.Id; break }
-            Start-Sleep -Milliseconds 120
+
+        # relaunch via Task Scheduler (user token, fresh env); success = the
+        # taskbar window exists; up to 3 attempts with stray cleanup between
+        $taskName = 'FlashRebootShellRestart'
+        $null = Invoke-FrEffect -Description "register one-shot shell restart task ($taskName)" -Effect {
+            & "$env:WINDIR\System32\schtasks.exe" /Create /TN $taskName /TR "`"$env:WINDIR\explorer.exe`"" `
+                /SC ONCE /ST 00:00 /IT /F /RL LIMITED | Out-Null
+        }
+        for ($attempt = 1; $attempt -le 3 -and -not $taskbarAlive; $attempt++) {
+            $null = Invoke-FrEffect -Description 'run shell restart task (medium-IL explorer, fresh env)' -Effect {
+                & "$env:WINDIR\System32\schtasks.exe" /Run /TN $taskName | Out-Null
+            }
+            $tbDeadline = [DateTime]::UtcNow.AddSeconds(8)
+            while ([DateTime]::UtcNow -lt $tbDeadline -and -not $taskbarAlive) {
+                $taskbarAlive = Test-FrTaskbarAlive
+                if (-not $afterPid) {
+                    $p = Get-Process -Name explorer -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Id -ne $beforePid } | Select-Object -First 1
+                    if ($p) { $afterPid = $p.Id }
+                }
+                if ($taskbarAlive) { break }
+                Start-Sleep -Milliseconds 150
+            }
+            if (-not $taskbarAlive -and -not $script:FR_DRYRUN) {
+                Write-FrLog ("shell: attempt {0} produced no taskbar - killing strays and retrying" -f $attempt) 'WARN'
+                Get-Process -Name explorer -ErrorAction SilentlyContinue | ForEach-Object { try { $_.Kill() } catch { } }
+                Start-Sleep -Milliseconds 600
+            }
+        }
+        $null = Invoke-FrEffect -Description 'remove one-shot task' -Effect {
+            & "$env:WINDIR\System32\schtasks.exe" /Delete /TN $taskName /F | Out-Null
+        }
+
+        # last-resort fallbacks: the desktop must stay alive
+        if (-not $taskbarAlive -and -not $script:FR_DRYRUN) {
+            $r = [FrNative]::LaunchWithFreshEnvironment((Join-Path $env:WINDIR 'explorer.exe'), '', $null)
+            if ($r -notlike 'ERR:*') {
+                $afterPid = [int]$r; $method = 'fresh-env-fallback-elevated'
+                Write-FrLog 'shell: FALLBACK relaunched ELEVATED (degraded; logged)' 'WARN'
+            } else {
+                $script:FR_ERRORS.Add("shell.freshenv: $r") | Out-Null
+            }
+            $tbDeadline = [DateTime]::UtcNow.AddSeconds(8)
+            while ([DateTime]::UtcNow -lt $tbDeadline -and -not $taskbarAlive) {
+                $taskbarAlive = Test-FrTaskbarAlive
+                if (-not $taskbarAlive) { Start-Sleep -Milliseconds 200 }
+            }
+        }
+        if ($taskbarAlive) {
+            Write-FrLog ("shell: taskbar verified alive (pid {0}) at {1} ms" -f $afterPid, $sw.ElapsedMilliseconds) 'OK'
+        } elseif (-not $script:FR_DRYRUN) {
+            $script:FR_ERRORS.Add('shell: taskbar window did not come back after restart') | Out-Null
+            Write-FrLog 'shell: taskbar window did NOT come back' 'ERROR'
+        }
+    } finally {
+        # ALWAYS restore Windows' own shell auto-recovery - a stuck 0 leaves
+        # the taskbar unrecoverable after any crash (this exact state was the
+        # reported taskbar breakage).
+        if ($null -ne $autoRestartSaved) {
+            Set-ItemProperty -Path $winlogonKey -Name AutoRestartShell -Value $autoRestartSaved
+            $back = (Get-ItemProperty -Path $winlogonKey -Name AutoRestartShell -ErrorAction SilentlyContinue).AutoRestartShell
+            if ($back -ne $autoRestartSaved) {
+                Set-ItemProperty -Path $winlogonKey -Name AutoRestartShell -Value $autoRestartSaved
+                $script:FR_ERRORS.Add("shell.autorestart: restore mismatch ($back != $autoRestartSaved)") | Out-Null
+            }
         }
     }
-    return [pscustomobject]@{ BeforePid = $beforePid; AfterPid = $afterPid; Method = $method }
+    return [pscustomobject]@{ BeforePid = $beforePid; AfterPid = $afterPid; Method = $method; TaskbarAlive = $taskbarAlive }
 }
 
 function Start-FrProcessWithFreshEnvironment {
@@ -1244,15 +1268,15 @@ function Get-FrSystemSnapshot {
 }
 
 function Test-FrUsable {
-    <# The READY proof: shell alive with a window (short grace wait - the
-       fresh shell warms up while later phases run, like a real boot), a
-       brand-new process can be spawned, and the network stack still answers. #>
+    <# The READY proof: the taskbar window (Shell_TrayWnd) exists (short grace
+       wait - the fresh shell warms up while later phases run, like a real
+       boot), a brand-new process can be spawned, and the network stack still
+       answers. #>
     [CmdletBinding()] param()
     $shellOk = $false
-    $winDeadline = [DateTime]::UtcNow.AddSeconds(3)
+    $winDeadline = [DateTime]::UtcNow.AddSeconds(4)
     do {
-        $shellOk = [bool](Get-Process -Name explorer -ErrorAction SilentlyContinue |
-                          Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+        $shellOk = Test-FrTaskbarAlive
         if ($shellOk) { break }
         Start-Sleep -Milliseconds 150
     } while ([DateTime]::UtcNow -lt $winDeadline)
@@ -1373,6 +1397,13 @@ function Invoke-FlashReboot {
     $script:FR_WALL.Stop()   # wall clock freezes at the READY point
 
     # ---- after the READY point: boot-like background completions + verification
+    # safety: Windows' shell auto-recovery must never stay disabled
+    $ars = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name AutoRestartShell -ErrorAction SilentlyContinue).AutoRestartShell
+    if ($null -ne $ars -and $ars -ne 1) {
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon' -Name AutoRestartShell -Value 1
+        Write-FrLog "AutoRestartShell was $ars - restored to 1 (taskbar auto-recovery guaranteed)" 'WARN'
+    }
+
     $taskCount = Get-FrLogonTaskCount
     Write-FrLog "Logon-triggered tasks inventoried (report-only): $taskCount" 'INFO'
 

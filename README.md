@@ -131,7 +131,8 @@ helper (cached as `logs\FrNative.dll`).
 ```
 FlashReboot.ps1        the engine (phases, guardrails, orchestrator, report)
 FlashReboot.Tests.ps1  self-verifying suite: 16 fast tests + -Live machine tests
-Run-FlashReboot.cmd    double-click launcher (elevates automatically)
+Run-FlashReboot.cmd    double-click launcher (elevates + verifies the taskbar)
+Verify-Taskbar.ps1     taskbar verify + auto-repair (called by the launcher)
 docs\DESIGN.md         the behavior contract (reboot-effect ledger)
 logs\                  run logs, reports, native assembly cache
 ```

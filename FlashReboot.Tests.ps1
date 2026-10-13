@@ -132,7 +132,8 @@ if ($isLive) {
     Assert-Test 'LIVE: explorer restart cycles shell' {
         $r = Restart-FrExplorer
         $r.BeforePid -ne $r.AfterPid -and $r.AfterPid -and
-        (Get-Process -Id $r.AfterPid -ErrorAction SilentlyContinue).MainWindowHandle -ne 0
+        (Test-FrTaskbarAlive) -and
+        ((Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon').AutoRestartShell -eq 1)
     }
     Assert-Test 'LIVE: service engine cycles BITS' {
         (Restart-FrService -Name 'BITS').Success
