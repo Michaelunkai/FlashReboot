@@ -166,6 +166,11 @@ function Invoke-FrWorkingSetSweep {
         try {
             $bare = $proc.ProcessName.ToLowerInvariant()
             if ($Protected.Pids.Contains($proc.Id) -or $Protected.Names.Contains($bare)) { $skipped++; continue }
+            # young processes (just launched - including the brand-new shell)
+            # already have fresh memory; sweeping them only causes post-READY
+            # stutter with zero reboot-effect gain
+            $started = try { $proc.StartTime } catch { $null }
+            if ($started -and ((Get-Date) - $started).TotalSeconds -lt 90) { $skipped++; continue }
             $h = $proc.Handle   # throws for inaccessible processes -> counted as skipped
             if ($h -eq [IntPtr]::Zero) { $skipped++; continue }
             if ([FrNative]::EmptyWorkingSet($h)) { $touched++ } else { $failed++ }
@@ -316,6 +321,13 @@ public static class FrNative {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     public static extern IntPtr FindWindowW(string lpClassName, string lpWindowName);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    public static extern uint RegisterWindowMessageW(string lpString);
+
+    [DllImport("user32.dll", SetLastError = true, EntryPoint = "SendMessageTimeoutW")]
+    public static extern IntPtr SendMessageTimeoutPtr(IntPtr hWnd, uint Msg, UIntPtr wParam, IntPtr lParam,
+        uint fuFlags, uint uTimeout, out UIntPtr lpdwResult);
+
     [StructLayout(LayoutKind.Sequential, Pack = 4)]
     public struct TOKEN_PRIVILEGES {
         public int PrivilegeCount;
@@ -446,6 +458,44 @@ function Test-FrTaskbarAlive {
     return ([FrNative]::FindWindowW('Shell_TrayWnd', $null) -ne [IntPtr]::Zero)
 }
 
+function Test-FrTaskbarHealthy {
+    <# Flawless-taskbar gate: the taskbar window exists, ANSWERS messages
+       within 2 s (a hung taskbar never does), and the Start menu host is
+       running. This is what "works the millisecond we finish" means. #>
+    [CmdletBinding()] param()
+    $tb = [FrNative]::FindWindowW('Shell_TrayWnd', $null)
+    if ($tb -eq [IntPtr]::Zero) { return $false }
+    $res = [UIntPtr]::Zero
+    $answered = ([FrNative]::SendMessageTimeoutPtr($tb, 0, [UIntPtr]::Zero, [IntPtr]::Zero,
+                    0x0008, 2000, [ref]$res) -ne [IntPtr]::Zero)   # WM_NULL, SMTO_ABORTIFHUNG
+    $startHost = [bool](Get-Process -Name StartMenuExperienceHost -ErrorAction SilentlyContinue)
+    return ($answered -and $startHost)
+}
+
+function Invoke-FrTaskbarRestore {
+    <# Makes running apps re-register their tray icons (the message the new
+       taskbar sends at creation - re-sent so no app misses it under load),
+       then verifies the taskbar is genuinely responsive. #>
+    [CmdletBinding()] param()
+    $msg = [FrNative]::RegisterWindowMessageW('TaskbarCreated')
+    $sent = $false
+    foreach ($pass in 1..2) {
+        $res = [UIntPtr]::Zero
+        $r = [FrNative]::SendMessageTimeoutPtr([IntPtr]0xFFFF, $msg, [UIntPtr]::Zero, [IntPtr]::Zero,
+                0x0008, 2000, [ref]$res)                    # HWND_BROADCAST
+        $sent = $sent -or ($r -ne [IntPtr]::Zero)
+        if ($pass -eq 1) { Start-Sleep -Milliseconds 300 }
+    }
+    $healthy = $false
+    $deadline = [DateTime]::UtcNow.AddSeconds(5)
+    do {
+        $healthy = Test-FrTaskbarHealthy
+        if ($healthy) { break }
+        Start-Sleep -Milliseconds 200
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return [pscustomobject]@{ Broadcast = $sent; Healthy = $healthy }
+}
+
 function Restart-FrExplorer {
     <# Reboot effect #4: the shell itself is cycled, with permanent taskbar
        guarantees:
@@ -502,9 +552,9 @@ function Restart-FrExplorer {
             $null = Invoke-FrEffect -Description 'run shell restart task (medium-IL explorer, fresh env)' -Effect {
                 & "$env:WINDIR\System32\schtasks.exe" /Run /TN $taskName | Out-Null
             }
-            $tbDeadline = [DateTime]::UtcNow.AddSeconds(8)
+            $tbDeadline = [DateTime]::UtcNow.AddSeconds(10)
             while ([DateTime]::UtcNow -lt $tbDeadline -and -not $taskbarAlive) {
-                $taskbarAlive = Test-FrTaskbarAlive
+                $taskbarAlive = Test-FrTaskbarHealthy
                 if (-not $afterPid) {
                     $p = Get-Process -Name explorer -ErrorAction SilentlyContinue |
                          Where-Object { $_.Id -ne $beforePid } | Select-Object -First 1
@@ -1268,15 +1318,15 @@ function Get-FrSystemSnapshot {
 }
 
 function Test-FrUsable {
-    <# The READY proof: the taskbar window (Shell_TrayWnd) exists (short grace
-       wait - the fresh shell warms up while later phases run, like a real
-       boot), a brand-new process can be spawned, and the network stack still
-       answers. #>
+    <# The READY proof: the taskbar is genuinely HEALTHY (exists + answers
+       messages + Start menu host alive - short grace wait, the fresh shell
+       warms up while later phases run, like a real boot), a brand-new process
+       can be spawned, and the network stack still answers. #>
     [CmdletBinding()] param()
     $shellOk = $false
-    $winDeadline = [DateTime]::UtcNow.AddSeconds(4)
+    $winDeadline = [DateTime]::UtcNow.AddSeconds(5)
     do {
-        $shellOk = Test-FrTaskbarAlive
+        $shellOk = Test-FrTaskbarHealthy
         if ($shellOk) { break }
         Start-Sleep -Milliseconds 150
     } while ([DateTime]::UtcNow -lt $winDeadline)
@@ -1390,6 +1440,15 @@ function Invoke-FlashReboot {
         }
     }
     Invoke-Phase 'memory' { Invoke-MemoryPhase -Protected $protected | Out-Null }
+
+    # tray-icon restoration + flawless-taskbar proof, AFTER all shell-churning
+    # work: every running app re-registers its tray icon, and the taskbar must
+    # answer messages before we dare say READY
+    Invoke-Phase 'taskbar' {
+        $t = Invoke-FrTaskbarRestore
+        Write-FrLog ("Taskbar restore: TaskbarCreated broadcast={0}, taskbar healthy={1}" -f `
+            $t.Broadcast, $t.Healthy) $(if ($t.Healthy) { 'OK' } else { 'WARN' })
+    }
 
     $after = Get-FrSystemSnapshot 'after'
     $usable = Test-FrUsable
