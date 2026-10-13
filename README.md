@@ -1,4 +1,4 @@
-<div align="center">
+﻿<div align="center">
 
 # ⚡ FlashReboot
 
@@ -131,8 +131,10 @@ helper (cached as `logs\FrNative.dll`).
 ```
 FlashReboot.ps1        the engine (phases, guardrails, orchestrator, report)
 FlashReboot.Tests.ps1  self-verifying suite: 16 fast tests + -Live machine tests
-Run-FlashReboot.cmd    double-click launcher (elevates + verifies the taskbar)
-Verify-Taskbar.ps1     taskbar verify + auto-repair (called by the launcher)
+Run-FlashReboot.cmd    double-click launcher (elevates, verifies taskbar, ends
+                       with dddesk desktop/taskbar reset, no pause)
+Verify-Taskbar.ps1     deep taskbar verify + auto-repair (used by the launcher)
+ddesk.ps1              your dddesk function - final command of every run
 docs\DESIGN.md         the behavior contract (reboot-effect ledger)
 logs\                  run logs, reports, native assembly cache
 ```
