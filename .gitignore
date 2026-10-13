@@ -1,0 +1,8 @@
+# runtime artifacts
+logs/
+releases/
+*.log
+*.dll
+
+# test scratch
+C:/

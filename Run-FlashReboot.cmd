@@ -1,0 +1,28 @@
+@echo off
+rem ============================================================
+rem  FlashReboot launcher - self-elevating, double-click ready
+rem ============================================================
+net session >nul 2>&1
+if %errorlevel% neq 0 (
+    echo Requesting administrator rights...
+    powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
+    exit /b
+)
+
+title FlashReboot v1.0.0
+cd /d "%~dp0"
+echo.
+echo   FlashReboot - every effect of a reboot, ready in seconds.
+echo   (use close window to abort before it finishes)
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0FlashReboot.ps1" %*
+set FR_EXIT=%errorlevel%
+echo.
+if "%FR_EXIT%"=="0" (
+    echo   [READY] Flash reboot complete. Report: logs\report-*.txt
+) else (
+    echo   [EXIT %FR_EXIT%] see logs\ for the contained-failure details.
+)
+echo.
+pause
+exit /b %FR_EXIT%
